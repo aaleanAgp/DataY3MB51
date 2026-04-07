@@ -1,0 +1,38 @@
+# Credenciales — NUNCA subir
+.env
+
+# Datos locales (pueden ser grandes)
+data/
+
+# Entornos virtuales
+venv/
+.venv/
+env/
+ENV/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# Outputs generados
+outputs/
+
+# Claude Code
+.claude/
+.mcp.json
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+Claude.md

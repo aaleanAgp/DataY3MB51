@@ -1,0 +1,10 @@
+pyodbc>=4.0.39
+pandas>=2.1.0
+pyarrow>=14.0.0
+tqdm>=4.66.0
+jupyter>=1.0.0
+notebook>=7.0.0
+matplotlib>=3.8.0
+seaborn>=0.13.0
+python-dotenv>=1.0.0
+openpyxl>=3.1.0
