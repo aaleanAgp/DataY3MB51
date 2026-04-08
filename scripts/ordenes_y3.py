@@ -10,8 +10,9 @@ Genera outputs/ordenes_y3.xlsx con 3 hojas:
 import pandas as pd
 from pathlib import Path
 
-PARQUET = Path('data/mb51.parquet')
-OUTPUT  = Path('outputs/ordenes_y3.xlsx')
+PARQUET         = Path('data/mb51.parquet')
+PARQUET_PREEMPQ = Path('data/preempaque.parquet')
+OUTPUT          = Path('outputs/ordenes_y3.xlsx')
 
 
 def parse_sap_num(serie: pd.Series) -> pd.Series:
@@ -23,24 +24,49 @@ def parse_sap_num(serie: pd.Series) -> pd.Series:
 
 def cargar_parquet() -> pd.DataFrame:
     df = pd.read_parquet(PARQUET)
+    if 'ORDEN' in df.columns:
+        df['ORDEN'] = df['ORDEN'].astype(str).str.strip().str.zfill(12)
     df['CANTIDAD_N'] = parse_sap_num(df['CANTIDAD'])
     df['IMPORTE_N']  = parse_sap_num(df['IMPORTE'])
     df['FECHA']      = pd.to_datetime(df['REGISTRADO_EL'], format='%Y%m%d', errors='coerce')
     return df
 
 
+def cargar_preempaque() -> pd.DataFrame:
+    if not PARQUET_PREEMPQ.exists():
+        return pd.DataFrame(columns=['ORDEN', 'ESTADO_PREEMPAQUE'])
+    df = pd.read_parquet(PARQUET_PREEMPQ)
+    df = df[['ORDEN']].drop_duplicates()
+    df['ESTADO_PREEMPAQUE'] = 'PREEMPAQUE'
+    return df
+
+
 if __name__ == '__main__':
-    print('Cargando parquet...')
+    print('Cargando parquets...')
     df = cargar_parquet()
+    df_preempq = cargar_preempaque()
 
-    # ── 1. Órdenes que consumieron Y3 ─────────────────────────────────────────
-    ordenes_y3 = set(
-        df[df['TEXTO_MATE'].str.contains('y3', case=False, na=False)]['ORDEN'].unique()
+    # ── 1. Órdenes que consumieron Y3 (directo o vía MODMED con lote Y3) ────────
+    mask_consumo = df['CLASE_MOV'].isin(['261', '201']) & df['ALMACEN'].isin(['IM01', 'PP04'])
+
+    mask_directo   = mask_consumo & df['TEXTO_MATE'].str.contains('y3', case=False, na=False)
+    lotes_y3       = set(df[mask_directo]['LOTE'].unique())
+    mask_indirecto = (
+        mask_consumo &
+        df['TEXTO_MATE'].str.contains('modmed', case=False, na=False) &
+        df['LOTE'].isin(lotes_y3)
     )
-    print(f'Ordenes con Y3: {len(ordenes_y3):,}')
 
-    # Todos los movimientos de esas órdenes (todos los materiales)
-    df_ord = df[df['ORDEN'].isin(ordenes_y3)].copy()
+    ordenes_y3 = set(df[mask_directo | mask_indirecto]['ORDEN'].unique())
+    print(f'Ordenes con Y3 directo          : {df[mask_directo]["ORDEN"].nunique():,}')
+    print(f'Ordenes con MODMED lote Y3      : {df[mask_indirecto]["ORDEN"].nunique():,}')
+    print(f'Total ordenes con Y3            : {len(ordenes_y3):,}')
+
+    # Todos los movimientos clase 261/201 de esas órdenes (receta completa)
+    df_ord = df[
+        df['ORDEN'].isin(ordenes_y3) &
+        df['CLASE_MOV'].isin(['261', '201'])
+    ].copy()
 
     # ── 2. Detalle: una fila por orden + material ──────────────────────────────
     detalle = (
@@ -56,7 +82,14 @@ if __name__ == '__main__':
         .reset_index()
         .sort_values(['ORDEN', 'MATERIAL'])
     )
-    detalle['es_y3'] = detalle['TEXTO_MATE'].str.contains('y3', case=False, na=False)
+    # Materiales MODMED que en estas órdenes usaron lotes Y3
+    modmed_y3_materiales = set(
+        df[mask_indirecto]['MATERIAL'].unique()
+    )
+    detalle['es_y3'] = (
+        detalle['TEXTO_MATE'].str.contains('y3', case=False, na=False) |
+        detalle['MATERIAL'].isin(modmed_y3_materiales)
+    )
     print(f'Filas en detalle (orden x material): {len(detalle):,}')
 
     # ── 3. Resumen: una fila por orden ─────────────────────────────────────────
@@ -75,6 +108,11 @@ if __name__ == '__main__':
 
     print('Construyendo resumen por orden...')
     resumen = detalle.groupby('ORDEN').apply(agg_orden).reset_index()
+    
+    # Cruzar con preempaque
+    resumen = resumen.merge(df_preempq, on='ORDEN', how='left')
+    resumen['ESTADO_PREEMPAQUE'] = resumen['ESTADO_PREEMPAQUE'].fillna('PENDIENTE')
+    
     resumen = resumen.sort_values('fecha_orden', ascending=False)
     print(f'Ordenes en resumen: {len(resumen):,}')
 

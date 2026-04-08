@@ -37,7 +37,6 @@ SELECT [ID],[MANDT],[DOC_MATERIAL],[POSICION],[REGISTRADO_EL],[HORA],
        [LOTE],[ORDEN],[CLASE_MOV],[USUARIO],[CANTIDAD],[UNIDAD],
        [IMPORTE],[MONEDA],[CENTRO],[ProcessDate]
 FROM [dbo].[ODATA_MB51_TEST]
-WHERE ALMACEN = 'PP04' AND CLASE_MOV IN ('261','201')
 """
 
 
@@ -88,10 +87,7 @@ def download_to_parquet():
 
     # Contar filas para la barra de progreso
     print("[INFO] Contando filas totales ...")
-    cursor.execute(
-        "SELECT COUNT(*) FROM [dbo].[ODATA_MB51_TEST] "
-        "WHERE ALMACEN = 'PP04' AND CLASE_MOV IN ('261','201')"
-    )
+    cursor.execute("SELECT COUNT(*) FROM [dbo].[ODATA_MB51_TEST]")
     total_rows = cursor.fetchone()[0]
     print(f"[INFO] Total de filas a descargar: {total_rows:,}")
 

@@ -30,7 +30,8 @@ outputs/
 # Claude Code
 .claude/
 .mcp.json
-
+.qwen/
+_analizar_flujo.py
 # OS
 .DS_Store
 Thumbs.db
