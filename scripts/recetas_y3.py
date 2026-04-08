@@ -160,10 +160,105 @@ def consultar_zfer_bom(conn, materiales: list) -> pd.DataFrame:
             print(f'    Progreso: {min(i + chunk_size, total):,}/{total:,} ZFER consultados')
 
     if chunks:
-        return pd.concat(chunks, ignore_index=True)
+        return pd.concat(chunks, ignore_index=True).drop_duplicates()
     return pd.DataFrame(columns=[
         'MATERIAL', 'POSICION', 'TIPO', 'ESPESOR',
         'CLAVE_FORMULA', 'CANTIDAD', 'CLASE'
+    ])
+
+
+# ── Análisis de composición ──────────────────────────────────────────────
+
+def analizar_composicion_sl_pc(df_bom: pd.DataFrame) -> pd.DataFrame:
+    """
+    Para cada ZFER, analiza las capas ENTRE el último cristal (SL) y el PC.
+
+    Reglas:
+    - SL = vidrio/cristal (TIPO = 'SL')
+    - PC = policarbonato (TIPO = 'PC')
+    - Último SL = el SL que está ANTES del primer PC (no el último absoluto)
+    - PC debe estar después del último SL
+    - Entre último SL y PC: identificar Y3, MODMED, otros PU/PVB
+    """
+    resultados = []
+
+    for zfer, grupo in df_bom.groupby('MATERIAL'):
+        bom_ordenado = grupo.sort_values('POSICION').reset_index(drop=True)
+
+        # Encontrar posiciones SL y PC
+        sl_mask = bom_ordenado['TIPO'] == 'SL'
+        pc_mask = bom_ordenado['TIPO'] == 'PC'
+
+        if not sl_mask.any() or not pc_mask.any():
+            continue
+
+        primer_pc_pos = bom_ordenado.loc[pc_mask, 'POSICION'].min()
+
+        # Último SL ANTES del primer PC
+        sl_antes_pc = bom_ordenado[sl_mask & (bom_ordenado['POSICION'] < primer_pc_pos)]
+        if sl_antes_pc.empty:
+            continue
+
+        ultimo_sl_pos = sl_antes_pc['POSICION'].max()
+
+        # Extraer capas ENTRE último SL y primer PC
+        entre_mask = (
+            (bom_ordenado['POSICION'] > ultimo_sl_pos) &
+            (bom_ordenado['POSICION'] < primer_pc_pos)
+        )
+        capas_entre = bom_ordenado[entre_mask].copy()
+
+        if capas_entre.empty:
+            continue
+
+        # Clasificar capas por CLASE
+        clases_entre = capas_entre['CLASE'].dropna().unique().tolist()
+
+        n_y3 = len([_ for _, row in capas_entre.iterrows()
+                     if str(row.get('CLASE', '')).startswith('Z_Y3_')])
+        n_modmed = len([_ for _, row in capas_entre.iterrows()
+                         if str(row.get('CLASE', '')).startswith('Z_PUMED_')])
+        n_otros = len(capas_entre) - n_y3 - n_modmed
+
+        # Construir etiqueta de composición
+        partes = []
+        if n_y3 > 0:
+            partes.append(f"Y3x{n_y3}")
+        if n_modmed > 0:
+            partes.append(f"MODMEDx{n_modmed}")
+        if n_otros > 0:
+            partes.append(f"OTROSx{n_otros}")
+
+        composicion = '+'.join(partes) if partes else 'DESCONOCIDO'
+
+        # Detalle de capas entre
+        detalle_capas = []
+        for _, row in capas_entre.iterrows():
+            tipo_clase = 'Y3' if str(row.get('CLASE', '')).startswith('Z_Y3_') \
+                        else 'MODMED' if str(row.get('CLASE', '')).startswith('Z_PUMED_') \
+                        else 'OTRO'
+            detalle_capas.append(
+                f"P{row['POSICION']}:{row['TIPO']}/{row.get('ESPESOR','?')}({tipo_clase})"
+            )
+
+        resultados.append({
+            'ZFER_MATERIAL': zfer,
+            'ultimo_SL_pos': int(ultimo_sl_pos),
+            'PC_pos': int(primer_pc_pos),
+            'capas_entre': ' | '.join(detalle_capas),
+            'composicion': composicion,
+            'n_capas_entre': len(capas_entre),
+            'n_y3': n_y3,
+            'n_modmed': n_modmed,
+            'n_otros_pvpb': n_otros,
+            'clases_entre': ' | '.join(sorted(clases_entre)),
+        })
+
+    if resultados:
+        return pd.DataFrame(resultados)
+    return pd.DataFrame(columns=[
+        'ZFER_MATERIAL', 'ultimo_SL_pos', 'PC_pos', 'capas_entre',
+        'composicion', 'n_capas_entre', 'n_y3', 'n_modmed', 'n_otros_pvpb', 'clases_entre'
     ])
 
 
@@ -297,12 +392,33 @@ if __name__ == '__main__':
         .sort_values(['ORDEN'])
     )
 
+    # ── Análisis de composición entre último SL y PC ─────────────────
+
+    print('\n  Analizando composición entre último cristal y PC...')
+    df_composicion = analizar_composicion_sl_pc(df_bom)
+
+    # Enriquecer con texto ZFER y ZFOR
+    df_composicion = df_composicion.merge(
+        df_zfer[['MATERIAL', 'TEXTO_BREVE_MATERIAL', 'ZFOR']].rename(
+            columns={'MATERIAL': 'ZFER_MATERIAL'}
+        ),
+        on='ZFER_MATERIAL', how='left'
+    )
+    # Reordenar columnas
+    df_composicion = df_composicion[[
+        'ZFER_MATERIAL', 'TEXTO_BREVE_MATERIAL', 'ZFOR',
+        'ultimo_SL_pos', 'PC_pos', 'n_capas_entre',
+        'n_y3', 'n_modmed', 'n_otros_pvpb',
+        'composicion', 'capas_entre', 'clases_entre'
+    ]].sort_values('composicion')
+
     # Exportar
     OUTPUT.parent.mkdir(exist_ok=True)
     with pd.ExcelWriter(OUTPUT, engine='openpyxl') as writer:
         df_hoja1.to_excel(writer, sheet_name='ordenes_zfer', index=False)
         df_hoja2.to_excel(writer, sheet_name='bom_por_zfer', index=False)
         df_hoja3.to_excel(writer, sheet_name='receta_orden',  index=False)
+        df_composicion.to_excel(writer, sheet_name='composicion_sl_pc', index=False)
 
     # Resumen
     print(f'\n{"=" * 60}')
@@ -316,5 +432,12 @@ if __name__ == '__main__':
     sin_zfer = df_hoja1['ZFER'].isna().sum()
     print(f'Órdenes sin ZFER en preempaque   : {sin_zfer:,}')
     print(f'Filas receta completa            : {len(df_hoja3):,}')
+    print(f'\n--- Composición entre SL y PC ---')
+    print(f'ZFER con SL→...→PC               : {len(df_composicion):,}')
+    if len(df_composicion) > 0:
+        print(f'Composiciones únicas             : {df_composicion["composicion"].nunique():,}')
+        print(f'Top composiciones:')
+        for comp, cnt in df_composicion['composicion'].value_counts().head(10).items():
+            print(f'  {comp}: {cnt:,}')
     print(f'{"=" * 60}')
     print(f'Exportado: {OUTPUT}')
