@@ -51,8 +51,9 @@ def cargar_preempaque() -> pd.DataFrame:
     df = pd.read_parquet(PARQUET_PREEMPQ)
     df['ORDEN'] = df['ORDEN'].astype(str).str.strip().str.zfill(12)
     df['ZFER'] = df['ZFER'].astype(str).str.strip()
-    # Solo necesitamos ORDEN y ZFER
-    return df[['ORDEN', 'ZFER']].drop_duplicates()
+    # Una orden = un ZFER (primero que aparece, descartar duplicados por ORDEN)
+    df = df.drop_duplicates(subset='ORDEN', keep='first')
+    return df[['ORDEN', 'ZFER']]
 
 
 def detect_odbc_driver() -> str:
@@ -328,19 +329,21 @@ if __name__ == '__main__':
     # ── 6. Cruzar datos y generar Excel ──────────────────────────────────
     print('\n[6/6] Cruzando datos y generando Excel...')
 
-    # Consumo por (orden + lote)
-    consumo_orden_lote = (
-        df_y3.groupby(['ORDEN', 'LOTE'])
+    # Consumo por orden (agregado, no por lote individual)
+    consumo_por_orden = (
+        df_y3.groupby('ORDEN')
         .agg(
             m2_y3        =('CANTIDAD_N', lambda x: x.abs().sum()),
             importe_COP  =('IMPORTE_N',  lambda x: x.abs().sum()),
+            lotes        =('LOTE',       'nunique'),
+            lista_lotes  =('LOTE',       lambda x: ' | '.join(sorted(x.unique()))),
             fecha_orden  =('FECHA',      'min'),
         )
         .reset_index()
     )
 
-    # Orden + Lote → ZFER via preempaque
-    df_con_zfer = consumo_orden_lote.merge(df_preempq_y3, on='ORDEN', how='left')
+    # Orden → ZFER via preempaque (1 orden = 1 ZFER)
+    df_con_zfer = consumo_por_orden.merge(df_preempq_y3, on='ORDEN', how='left')
 
     # Agregar ZFOR
     df_con_zfer = df_con_zfer.merge(df_zfer, left_on='ZFER', right_on='MATERIAL', how='left')
@@ -351,11 +354,13 @@ if __name__ == '__main__':
 
     # Hoja 1: ordenes_zfer
     df_hoja1 = df_con_zfer[[
-        'ORDEN', 'LOTE', 'ZFER', 'TEXTO_BREVE_MATERIAL', 'ZFOR',
-        'ESTADO_PREEMPAQUE', 'fecha_orden', 'm2_y3', 'importe_COP'
+        'ORDEN', 'lista_lotes', 'ZFER', 'TEXTO_BREVE_MATERIAL', 'ZFOR',
+        'ESTADO_PREEMPAQUE', 'fecha_orden', 'm2_y3', 'importe_COP', 'lotes'
     ]].rename(columns={
         'TEXTO_BREVE_MATERIAL': 'TEXTO_ZFER',
-    }).sort_values(['ORDEN', 'ZFER'])
+        'lista_lotes': 'LOTES',
+        'lotes': 'N_LOTES',
+    }).sort_values(['ORDEN'])
 
     # Hoja 2: bom_por_zfer
     df_hoja2 = (
@@ -371,7 +376,6 @@ if __name__ == '__main__':
     )
 
     # Hoja 3: receta_orden (resumen por orden, no cross join completo)
-    # Para cada orden: ZFER + resumen del BOM
     resumen_bom = (
         df_bom.groupby('MATERIAL')
         .agg(
@@ -385,7 +389,7 @@ if __name__ == '__main__':
     )
 
     df_hoja3 = (
-        df_con_zfer[['ORDEN', 'LOTE', 'ZFER', 'ZFOR', 'ESTADO_PREEMPAQUE',
+        df_con_zfer[['ORDEN', 'ZFER', 'ZFOR', 'ESTADO_PREEMPAQUE',
                       'fecha_orden', 'm2_y3']]
         .merge(resumen_bom.rename(columns={'MATERIAL': 'ZFER'}),
                on='ZFER', how='left')
@@ -412,6 +416,20 @@ if __name__ == '__main__':
         'composicion', 'capas_entre', 'clases_entre'
     ]].sort_values('composicion')
 
+    # ── Hoja 5: Ordenes por composición con fechas ─────────────────────
+    df_hoja5 = (
+        df_hoja1[['ORDEN', 'ZFER', 'TEXTO_ZFER', 'ZFOR',
+                   'ESTADO_PREEMPAQUE', 'fecha_orden', 'm2_y3', 'importe_COP', 'LOTES', 'N_LOTES']]
+        .merge(df_composicion[['ZFER_MATERIAL', 'composicion', 'n_y3', 'n_modmed']],
+               left_on='ZFER', right_on='ZFER_MATERIAL', how='left')
+        .sort_values(['composicion', 'ORDEN'])
+        [[
+            'ORDEN', 'ZFER', 'TEXTO_ZFER', 'composicion',
+            'n_y3', 'n_modmed', 'ESTADO_PREEMPAQUE',
+            'fecha_orden', 'm2_y3', 'importe_COP', 'LOTES', 'N_LOTES'
+        ]]
+    )
+
     # Exportar
     OUTPUT.parent.mkdir(exist_ok=True)
     with pd.ExcelWriter(OUTPUT, engine='openpyxl') as writer:
@@ -419,6 +437,7 @@ if __name__ == '__main__':
         df_hoja2.to_excel(writer, sheet_name='bom_por_zfer', index=False)
         df_hoja3.to_excel(writer, sheet_name='receta_orden',  index=False)
         df_composicion.to_excel(writer, sheet_name='composicion_sl_pc', index=False)
+        df_hoja5.to_excel(writer, sheet_name='ordenes_composicion', index=False)
 
     # Resumen
     print(f'\n{"=" * 60}')
@@ -432,12 +451,20 @@ if __name__ == '__main__':
     sin_zfer = df_hoja1['ZFER'].isna().sum()
     print(f'Órdenes sin ZFER en preempaque   : {sin_zfer:,}')
     print(f'Filas receta completa            : {len(df_hoja3):,}')
+    print(f'Filas ordenes_composicion        : {len(df_hoja5):,}')
     print(f'\n--- Composición entre SL y PC ---')
     print(f'ZFER con SL→...→PC               : {len(df_composicion):,}')
     if len(df_composicion) > 0:
         print(f'Composiciones únicas             : {df_composicion["composicion"].nunique():,}')
-        print(f'Top composiciones:')
-        for comp, cnt in df_composicion['composicion'].value_counts().head(10).items():
-            print(f'  {comp}: {cnt:,}')
+        print(f'Órdenes por composición:')
+        resumen_comp = df_hoja5.groupby('composicion').agg(
+            zfer=('ZFER', 'nunique'),
+            ordenes=('ORDEN', 'nunique'),
+            primera_fecha=('fecha_orden', 'min'),
+            ultima_fecha=('fecha_orden', 'max'),
+        ).sort_values('ordenes', ascending=False)
+        for comp, row in resumen_comp.iterrows():
+            print(f'  {comp}: {int(row["ordenes"]):,} ordenes ({int(row["zfer"])} ZFER) '
+                  f'| {row["primera_fecha"].date()} → {row["ultima_fecha"].date()}')
     print(f'{"=" * 60}')
     print(f'Exportado: {OUTPUT}')
